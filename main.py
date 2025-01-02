@@ -33,7 +33,6 @@ class FileToCreate(BaseModel):
     path: str
     content: str
 
-# NEW: Diff editing structure
 class FileToEdit(BaseModel):
     path: str
     original_snippet: str
@@ -42,11 +41,10 @@ class FileToEdit(BaseModel):
 class AssistantResponse(BaseModel):
     assistant_reply: str
     files_to_create: Optional[List[FileToCreate]] = None
-    # NEW: optionally hold diff edits
     files_to_edit: Optional[List[FileToEdit]] = None
 
 # --------------------------------------------------------------------------------
-# 3. system prompt
+# 3. System prompt
 # --------------------------------------------------------------------------------
 system_PROMPT = dedent("""\
     You are an elite software engineer called DeepSeek Engineer with decades of experience across all programming domains.
@@ -55,24 +53,10 @@ system_PROMPT = dedent("""\
 
     Core capabilities:
     1. Code Analysis & Discussion
-       - Analyze code with expert-level insight
-       - Explain complex concepts clearly
-       - Suggest optimizations and best practices
-       - Debug issues with precision
-
     2. File Operations:
        a) Read existing files
-          - Access user-provided file contents for context
-          - Analyze multiple files to understand project structure
-       
        b) Create new files
-          - Generate complete new files with proper structure
-          - Create complementary files (tests, configs, etc.)
-       
        c) Edit existing files
-          - Make precise changes using diff-based editing
-          - Modify specific sections while preserving context
-          - Suggest refactoring improvements
 
     Output Format:
     You must provide responses in this JSON structure:
@@ -92,26 +76,14 @@ system_PROMPT = dedent("""\
         }
       ]
     }
-
-    Guidelines:
-    1. For normal responses, use 'assistant_reply'
-    2. When creating files, include full content in 'files_to_create'
-    3. For editing files:
-       - Use 'files_to_edit' for precise changes
-       - Include enough context in original_snippet to locate the change
-       - Ensure new_snippet maintains proper indentation
-       - Prefer targeted edits over full file replacements
-    4. Always explain your changes and reasoning
-    5. Consider edge cases and potential impacts
-    6. Follow language-specific best practices
-    7. Suggest tests or validation steps when appropriate
-
-    Remember: You're a senior engineer - be thorough, precise, and thoughtful in your solutions.
 """)
 
 # --------------------------------------------------------------------------------
-# 4. Helper functions 
+# 4. Helper functions
 # --------------------------------------------------------------------------------
+
+# File history for undo functionality
+file_history = []
 
 def read_local_file(file_path: str) -> str:
     """Return the text content of a local file."""
@@ -121,30 +93,26 @@ def read_local_file(file_path: str) -> str:
 def create_file(path: str, content: str):
     """Create (or overwrite) a file at 'path' with the given 'content'."""
     file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)  # ensures any dirs exist
+    if file_path.exists():
+        # Backup existing file
+        with open(file_path, "r", encoding="utf-8") as f:
+            backup_content = f.read()
+        file_history.append(("edit", str(file_path), backup_content))
+    else:
+        # Mark as new file
+        file_history.append(("create", str(file_path), None))
+    
+    # Proceed with creation
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(content)
     console.print(f"[green]✓[/green] Created/updated file at '[cyan]{file_path}[/cyan]'")
-    
-    # Record the action
-    conversation_history.append({
-        "role": "assistant",
-        "content": f"✓ Created/updated file at '{file_path}'"
-    })
-    
-    # NEW: Add the actual content to conversation context
-    normalized_path = normalize_path(str(file_path))
-    conversation_history.append({
-        "role": "system",
-        "content": f"Content of file '{normalized_path}':\n\n{content}"
-    })
 
-# NEW: Show the user a table of proposed edits and confirm
 def show_diff_table(files_to_edit: List[FileToEdit]) -> None:
+    """Show a table of proposed edits."""
     if not files_to_edit:
         return
     
-    # Enable multi-line rows by setting show_lines=True
     table = Table(title="Proposed Edits", show_header=True, header_style="bold magenta", show_lines=True)
     table.add_column("File Path", style="cyan")
     table.add_column("Original", style="red")
@@ -155,34 +123,50 @@ def show_diff_table(files_to_edit: List[FileToEdit]) -> None:
     
     console.print(table)
 
-# NEW: Apply diff edits
 def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
-    """Reads the file at 'path', replaces the first occurrence of 'original_snippet' with 'new_snippet', then overwrites."""
+    """Apply a diff edit to a file."""
     try:
         content = read_local_file(path)
         if original_snippet in content:
+            # Backup before editing
+            file_history.append(("edit", path, content))
             updated_content = content.replace(original_snippet, new_snippet, 1)
-            create_file(path, updated_content)  # This will now also update conversation context
+            create_file(path, updated_content)
             console.print(f"[green]✓[/green] Applied diff edit to '[cyan]{path}[/cyan]'")
-            conversation_history.append({
-                "role": "assistant",
-                "content": f"✓ Applied diff edit to '{path}'"
-            })
         else:
-            # NEW: Add debug info about the mismatch
             console.print(f"[yellow]⚠[/yellow] Original snippet not found in '[cyan]{path}[/cyan]'. No changes made.", style="yellow")
-            console.print("\nExpected snippet:", style="yellow")
-            console.print(Panel(original_snippet, title="Expected", border_style="yellow"))
-            console.print("\nActual file content:", style="yellow")
-            console.print(Panel(content, title="Actual", border_style="yellow"))
     except FileNotFoundError:
         console.print(f"[red]✗[/red] File not found for diff editing: '[cyan]{path}[/cyan]'", style="red")
 
+def undo_last_change(num_undos: int = 1):
+    """Undo the last file change(s)."""
+    if not file_history:
+        console.print("[yellow]ℹ[/yellow] No changes to undo.", style="yellow")
+        return
+    
+    for _ in range(num_undos):
+        if not file_history:
+            console.print("[yellow]ℹ[/yellow] No more changes to undo.", style="yellow")
+            break
+        
+        last_action = file_history[-1]  # Peek at last action without removing yet
+        action_type, path, backup_content = last_action
+        
+        try:
+            if action_type == "create":
+                Path(path).unlink()
+                console.print(f"[green]✓[/green] Deleted file '[cyan]{path}[/cyan]' (undo creation)")
+            elif action_type == "edit":
+                create_file(path, backup_content)
+                console.print(f"[green]✓[/green] Restored file '[cyan]{path}[/cyan]' (undo edit)")
+            
+            file_history.pop()  # Only remove from history if successful
+        except Exception as e:
+            console.print(f"[red]✗[/red] Failed to undo: {str(e)}", style="red")
+            break
+
 def try_handle_add_command(user_input: str) -> bool:
-    """
-    If user_input starts with '/add ', read that file and insert its content
-    into conversation as a system message. Returns True if handled; else False.
-    """
+    """Handle the /add command to include a file in the conversation."""
     prefix = "/add "
     if user_input.strip().lower().startswith(prefix):
         file_path = user_input[len(prefix):].strip()
@@ -199,10 +183,7 @@ def try_handle_add_command(user_input: str) -> bool:
     return False
 
 def ensure_file_in_context(file_path: str) -> bool:
-    """
-    Ensures the file content is in the conversation context.
-    Returns True if successful, False if file not found.
-    """
+    """Ensure the file content is in the conversation context."""
     try:
         normalized_path = normalize_path(file_path)
         content = read_local_file(normalized_path)
@@ -233,10 +214,7 @@ conversation_history = [
 # --------------------------------------------------------------------------------
 
 def guess_files_in_message(user_message: str) -> List[str]:
-    """
-    Attempt to guess which files the user might be referencing.
-    Returns normalized absolute paths.
-    """
+    """Guess which files the user might be referencing."""
     recognized_extensions = [".css", ".html", ".js", ".py", ".json", ".md"]
     potential_paths = []
     for word in user_message.split():
@@ -250,22 +228,15 @@ def guess_files_in_message(user_message: str) -> List[str]:
     return potential_paths
 
 def stream_openai_response(user_message: str):
-    """
-    Streams the DeepSeek chat completion response and handles structured output.
-    Returns the final AssistantResponse.
-    """
-    # Attempt to guess which file(s) user references
+    """Stream the DeepSeek chat completion response and handle structured output."""
     potential_paths = guess_files_in_message(user_message)
-    
     valid_files = {}
 
-    # Try to read all potential files before the API call
     for path in potential_paths:
         try:
             content = read_local_file(path)
-            valid_files[path] = content  # path is already normalized
+            valid_files[path] = content
             file_marker = f"Content of file '{path}'"
-            # Add to conversation if we haven't already
             if not any(file_marker in msg["content"] for msg in conversation_history):
                 conversation_history.append({
                     "role": "system",
@@ -276,7 +247,6 @@ def stream_openai_response(user_message: str):
             console.print(f"[red]✗[/red] {error_msg}", style="red")
             continue
 
-    # Now proceed with the API call
     conversation_history.append({"role": "user", "content": user_message})
 
     try:
@@ -301,20 +271,16 @@ def stream_openai_response(user_message: str):
 
         try:
             parsed_response = json.loads(full_content)
-            
-            # [NEW] Ensure assistant_reply is present
             if "assistant_reply" not in parsed_response:
                 parsed_response["assistant_reply"] = ""
 
-            # If assistant tries to edit files not in valid_files, remove them
             if "files_to_edit" in parsed_response and parsed_response["files_to_edit"]:
                 new_files_to_edit = []
                 for edit in parsed_response["files_to_edit"]:
                     try:
                         edit_abs_path = normalize_path(edit["path"])
-                        # If we have the file in context or can read it now
                         if edit_abs_path in valid_files or ensure_file_in_context(edit_abs_path):
-                            edit["path"] = edit_abs_path  # Use normalized path
+                            edit["path"] = edit_abs_path
                             new_files_to_edit.append(edit)
                     except (OSError, ValueError):
                         console.print(f"[yellow]⚠[/yellow] Skipping invalid path: '{edit['path']}'", style="yellow")
@@ -322,8 +288,6 @@ def stream_openai_response(user_message: str):
                 parsed_response["files_to_edit"] = new_files_to_edit
 
             response_obj = AssistantResponse(**parsed_response)
-
-            # Save the assistant's textual reply to conversation
             conversation_history.append({
                 "role": "assistant",
                 "content": response_obj.assistant_reply
@@ -359,6 +323,7 @@ def main():
     console.print(
         "To include a file in the conversation, use '[bold magenta]/add path/to/file[/bold magenta]'.\n"
         "Type '[bold red]exit[/bold red]' or '[bold red]quit[/bold red]' to end.\n"
+        "To undo changes, use '[bold magenta]/undo[/bold magenta]' or '[bold magenta]/undo N[/bold magenta]' to undo N changes.\n"
     )
 
     while True:
@@ -375,8 +340,17 @@ def main():
             console.print("[yellow]Goodbye![/yellow]")
             break
 
-        # If user is reading a file
+        # Handle /add command
         if try_handle_add_command(user_input):
+            continue
+
+        # Handle /undo command
+        if user_input.lower().startswith("/undo"):
+            try:
+                num_undos = int(user_input.split()[1]) if len(user_input.split()) > 1 else 1
+                undo_last_change(num_undos)
+            except ValueError:
+                console.print("[red]✗[/red] Invalid number of undos. Usage: /undo [N]", style="red")
             continue
 
         # Get streaming response from OpenAI (DeepSeek)
