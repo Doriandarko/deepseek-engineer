@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.style import Style
+import shutil
 
 # Initialize Rich console
 console = Console()
@@ -64,11 +65,11 @@ system_PROMPT = dedent("""\
        a) Read existing files
           - Access user-provided file contents for context
           - Analyze multiple files to understand project structure
-       
+
        b) Create new files
           - Generate complete new files with proper structure
           - Create complementary files (tests, configs, etc.)
-       
+
        c) Edit existing files
           - Make precise changes using diff-based editing
           - Modify specific sections while preserving context
@@ -110,13 +111,20 @@ system_PROMPT = dedent("""\
 """)
 
 # --------------------------------------------------------------------------------
-# 4. Helper functions 
+# 4. Helper functions
 # --------------------------------------------------------------------------------
 
 def read_local_file(file_path: str) -> str:
     """Return the text content of a local file."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"File not found: {file_path}")
+    except UnicodeDecodeError:
+        raise ValueError(f"Could not decode file: {file_path}")
+    except Exception as e:
+        raise RuntimeError(f"Error reading file {file_path}: {str(e)}")
 
 def create_file(path: str, content: str):
     """Create (or overwrite) a file at 'path' with the given 'content'."""
@@ -125,13 +133,13 @@ def create_file(path: str, content: str):
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(content)
     console.print(f"[green]✓[/green] Created/updated file at '[cyan]{file_path}[/cyan]'")
-    
+
     # Record the action
     conversation_history.append({
         "role": "assistant",
         "content": f"✓ Created/updated file at '{file_path}'"
     })
-    
+
     # NEW: Add the actual content to conversation context
     normalized_path = normalize_path(str(file_path))
     conversation_history.append({
@@ -143,7 +151,7 @@ def create_file(path: str, content: str):
 def show_diff_table(files_to_edit: List[FileToEdit]) -> None:
     if not files_to_edit:
         return
-    
+
     # Enable multi-line rows by setting show_lines=True
     table = Table(title="Proposed Edits", show_header=True, header_style="bold magenta", show_lines=True)
     table.add_column("File Path", style="cyan")
@@ -152,24 +160,31 @@ def show_diff_table(files_to_edit: List[FileToEdit]) -> None:
 
     for edit in files_to_edit:
         table.add_row(edit.path, edit.original_snippet, edit.new_snippet)
-    
+
     console.print(table)
 
 # NEW: Apply diff edits
 def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
     """Reads the file at 'path', replaces the first occurrence of 'original_snippet' with 'new_snippet', then overwrites."""
     try:
+        # Create backup before editing
+        backup_path = f"{path}.bak"
+        if Path(path).exists():
+            shutil.copy2(path, backup_path)
+
         content = read_local_file(path)
         if original_snippet in content:
             updated_content = content.replace(original_snippet, new_snippet, 1)
-            create_file(path, updated_content)  # This will now also update conversation context
+            create_file(path, updated_content)
             console.print(f"[green]✓[/green] Applied diff edit to '[cyan]{path}[/cyan]'")
             conversation_history.append({
                 "role": "assistant",
                 "content": f"✓ Applied diff edit to '{path}'"
             })
+            # Clean up backup if successful
+            if Path(backup_path).exists():
+                Path(backup_path).unlink()
         else:
-            # NEW: Add debug info about the mismatch
             console.print(f"[yellow]⚠[/yellow] Original snippet not found in '[cyan]{path}[/cyan]'. No changes made.", style="yellow")
             console.print("\nExpected snippet:", style="yellow")
             console.print(Panel(original_snippet, title="Expected", border_style="yellow"))
@@ -177,6 +192,12 @@ def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
             console.print(Panel(content, title="Actual", border_style="yellow"))
     except FileNotFoundError:
         console.print(f"[red]✗[/red] File not found for diff editing: '[cyan]{path}[/cyan]'", style="red")
+    except Exception as e:
+        console.print(f"[red]✗[/red] Error applying diff edit: {str(e)}", style="red")
+        # Restore from backup if error occurred
+        if Path(backup_path).exists():
+            shutil.move(backup_path, path)
+            console.print(f"[yellow]ℹ[/yellow] Restored original file from backup", style="yellow")
 
 def try_handle_add_command(user_input: str) -> bool:
     """
@@ -219,7 +240,15 @@ def ensure_file_in_context(file_path: str) -> bool:
 
 def normalize_path(path_str: str) -> str:
     """Return a canonical, absolute version of the path."""
-    return str(Path(path_str).resolve())
+    try:
+        path = Path(path_str)
+        if not path_str.strip():
+            raise ValueError("Empty path provided")
+        if path.is_absolute():
+            return str(path.resolve())
+        return str((Path.cwd() / path).resolve())
+    except Exception as e:
+        raise ValueError(f"Invalid path '{path_str}': {str(e)}")
 
 # --------------------------------------------------------------------------------
 # 5. Conversation state
@@ -237,7 +266,7 @@ def guess_files_in_message(user_message: str) -> List[str]:
     Attempt to guess which files the user might be referencing.
     Returns normalized absolute paths.
     """
-    recognized_extensions = [".css", ".html", ".js", ".py", ".json", ".md"]
+    recognized_extensions = [".css", ".html", ".js", ".py", ".json", ".md", ".txt", ".yaml", ".yml", ".xml"]
     potential_paths = []
     for word in user_message.split():
         if any(ext in word for ext in recognized_extensions) or "/" in word:
@@ -256,7 +285,7 @@ def stream_openai_response(user_message: str):
     """
     # Attempt to guess which file(s) user references
     potential_paths = guess_files_in_message(user_message)
-    
+
     valid_files = {}
 
     # Try to read all potential files before the API call
@@ -301,7 +330,7 @@ def stream_openai_response(user_message: str):
 
         try:
             parsed_response = json.loads(full_content)
-            
+
             # [NEW] Ensure assistant_reply is present
             if "assistant_reply" not in parsed_response:
                 parsed_response["assistant_reply"] = ""
