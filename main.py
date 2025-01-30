@@ -93,6 +93,8 @@ system_PROMPT = dedent("""\
       ]
     }
 
+    VERY IMPORTANT: do not quote the json in markdown, (no ```json)
+
     Guidelines:
     1. For normal responses, use 'assistant_reply'
     2. When creating files, include full content in 'files_to_create'
