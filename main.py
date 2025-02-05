@@ -21,10 +21,22 @@ console = Console()
 # 1. Configure OpenAI client and load environment variables
 # --------------------------------------------------------------------------------
 load_dotenv()  # Load environment variables from .env file
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)  # Configure for DeepSeek API
+
+
+# 1.1 Pick Between DeepSeek and Groq API Providers
+def from_env():
+    if "DEEPSEEK_API_KEY" in os.environ:
+        os.environ["OPENAI_API_KEY"] = os.environ["DEEPSEEK_API_KEY"]
+        os.environ["OPENAI_BASE_URL"] = "https://api.deepseek.com"
+        os.environ["MODEL_NAME"] = "deepseek-chat"
+    elif "GROQ_API_KEY" in os.environ:
+        os.environ["OPENAI_API_KEY"] = os.environ["GROQ_API_KEY"]
+        os.environ["OPENAI_BASE_URL"] = "https://api.groq.com/api/openai"
+        os.environ["MODEL_NAME"] = "deepseek-r1-distill-llama-70b"
+    return OpenAI()  # Configure for DeepSeek and Groq API
+
+
+client = from_env()
 
 # --------------------------------------------------------------------------------
 # 2. Define our schema using Pydantic for type safety
@@ -110,7 +122,7 @@ system_PROMPT = dedent("""\
 """)
 
 # --------------------------------------------------------------------------------
-# 4. Helper functions 
+# 4. Helper functions
 # --------------------------------------------------------------------------------
 
 def read_local_file(file_path: str) -> str:
@@ -256,7 +268,7 @@ def stream_openai_response(user_message: str):
     """
     # Attempt to guess which file(s) user references
     potential_paths = guess_files_in_message(user_message)
-    
+
     valid_files = {}
 
     # Try to read all potential files before the API call
@@ -281,11 +293,11 @@ def stream_openai_response(user_message: str):
 
     try:
         stream = client.chat.completions.create(
-            model="deepseek-chat",
+            model=os.environ["MODEL_NAME"],
             messages=conversation_history,
             response_format={"type": "json_object"},
             max_completion_tokens=8000,
-            stream=True
+            stream=True,
         )
 
         console.print("\nAssistant> ", style="bold blue", end="")
@@ -301,7 +313,7 @@ def stream_openai_response(user_message: str):
 
         try:
             parsed_response = json.loads(full_content)
-            
+
             # [NEW] Ensure assistant_reply is present
             if "assistant_reply" not in parsed_response:
                 parsed_response["assistant_reply"] = ""
