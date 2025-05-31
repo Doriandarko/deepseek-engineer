@@ -1,4 +1,5 @@
 openai
+ollama
 pydantic
 python-dotenv
 rich
