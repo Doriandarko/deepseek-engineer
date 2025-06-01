@@ -32,6 +32,9 @@ prompt_session = PromptSession(
     })
 )
 
+# Global base directory for operations (default: current working directory)
+base_dir = Path.cwd()
+
 # --------------------------------------------------------------------------------
 # 0. Configuration Constants
 # --------------------------------------------------------------------------------
@@ -256,11 +259,157 @@ system_PROMPT = dedent("""\
 """)
 
 # --------------------------------------------------------------------------------
-# 4. Helper functions 
+# 4. NEW: Smart conversation history management
+# --------------------------------------------------------------------------------
+
+def smart_truncate_history(conversation_history, max_messages=50):
+    """
+    Truncate conversation history while preserving tool call sequences and important context.
+    """
+    if len(conversation_history) <= max_messages:
+        return conversation_history
+    
+    # Always keep system prompt at index 0 and any critical system messages
+    system_messages = []
+    other_messages = []
+    
+    for msg in conversation_history:
+        if msg["role"] == "system":
+            system_messages.append(msg)
+        else:
+            other_messages.append(msg)
+    
+    # Keep the main system prompt and recent file context messages
+    if len(system_messages) > 1:
+        # Keep first system message (main prompt) and last few file contexts
+        important_system = [system_messages[0]]
+        file_contexts = [msg for msg in system_messages[1:] if "User added file" in msg["content"]]
+        important_system.extend(file_contexts[-3:])  # Keep last 3 file contexts
+        system_messages = important_system
+    
+    # Work backwards to find a good truncation point for conversation flow
+    keep_messages = []
+    i = len(other_messages) - 1
+    messages_to_keep = max_messages - len(system_messages)
+    
+    while i >= 0 and len(keep_messages) < messages_to_keep:
+        current_msg = other_messages[i]
+        
+        # If this is a tool result, we need to keep the corresponding assistant message
+        if current_msg["role"] == "tool":
+            # Collect all tool results for this sequence
+            tool_sequence = []
+            while i >= 0 and other_messages[i]["role"] == "tool":
+                tool_sequence.insert(0, other_messages[i])
+                i -= 1
+            
+            # Add the tool results
+            keep_messages = tool_sequence + keep_messages
+            
+            # Find and add the corresponding assistant message with tool_calls
+            if i >= 0 and other_messages[i]["role"] == "assistant" and other_messages[i].get("tool_calls"):
+                keep_messages.insert(0, other_messages[i])
+                i -= 1
+        else:
+            # Regular message (user or assistant)
+            keep_messages.insert(0, current_msg)
+            i -= 1
+    
+    # Combine system messages with kept conversation messages
+    result = system_messages + keep_messages
+    
+    # Final safety check - if still too long, trim more aggressively but keep recent complete sequences
+    if len(result) > max_messages:
+        excess = len(result) - max_messages
+        # Remove from the middle, keeping system messages and recent conversation
+        system_count = len(system_messages)
+        result = system_messages + keep_messages[excess:]
+    
+    return result
+
+def validate_tool_calls(accumulated_tool_calls):
+    """
+    Validate accumulated tool calls and provide debugging info.
+    """
+    if not accumulated_tool_calls:
+        return []
+    
+    valid_calls = []
+    for i, tool_call in enumerate(accumulated_tool_calls):
+        # Check for required fields
+        if not tool_call.get("id"):
+            console.print(f"[yellow]⚠ Tool call {i} missing ID, skipping[/yellow]")
+            continue
+        
+        func_name = tool_call.get("function", {}).get("name")
+        if not func_name:
+            console.print(f"[yellow]⚠ Tool call {i} missing function name, skipping[/yellow]")
+            continue
+        
+        func_args = tool_call.get("function", {}).get("arguments", "")
+        
+        # Validate JSON arguments
+        try:
+            if func_args:
+                json.loads(func_args)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]✗ Tool call {i} has invalid JSON arguments: {e}[/red]")
+            console.print(f"[red]  Arguments: {func_args}[/red]")
+            continue
+        
+        valid_calls.append(tool_call)
+    
+    if len(valid_calls) != len(accumulated_tool_calls):
+        console.print(f"[yellow]⚠ Kept {len(valid_calls)}/{len(accumulated_tool_calls)} tool calls[/yellow]")
+    
+    return valid_calls
+
+def add_file_context_smartly(conversation_history, file_path, content, max_context_files=5):
+    """
+    Add file context while managing system message bloat and avoiding duplicates.
+    """
+    marker = f"User added file '{file_path}'"
+    
+    # Remove any existing context for this exact file to avoid duplicates
+    conversation_history[:] = [
+        msg for msg in conversation_history 
+        if not (msg["role"] == "system" and marker in msg["content"])
+    ]
+    
+    # Count existing file context messages
+    file_context_count = sum(
+        1 for msg in conversation_history 
+        if msg["role"] == "system" and "User added file" in msg["content"]
+    )
+    
+    # If too many file contexts, remove oldest ones (but keep the main system prompt)
+    if file_context_count >= max_context_files:
+        removed_count = 0
+        new_history = []
+        
+        for msg in conversation_history:
+            if (msg["role"] == "system" and 
+                "User added file" in msg["content"] and 
+                removed_count < (file_context_count - max_context_files + 1)):
+                removed_count += 1
+                continue  # Skip this old file context
+            new_history.append(msg)
+        
+        conversation_history[:] = new_history
+    
+    # Add new file context
+    conversation_history.append({
+        "role": "system", 
+        "content": f"{marker}. Content:\n\n{content}"
+    })
+
+# --------------------------------------------------------------------------------
+# 4. Helper functions (updated)
 # --------------------------------------------------------------------------------
 
 def read_local_file(file_path: str) -> str:
-    with open(file_path, "r", encoding="utf-8") as f:
+    full_path = (base_dir / file_path).resolve()
+    with open(full_path, "r", encoding="utf-8") as f:
         return f.read()
 
 def create_file(path: str, content: str):
@@ -288,7 +437,6 @@ def show_diff_table(files_to_edit: List[FileToEdit]) -> None:
     table.add_column("New", style="bright_green")
     for edit in files_to_edit: table.add_row(edit.path, edit.original_snippet, edit.new_snippet)
     console.print(table)
-
 
 def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
     content = ""
@@ -320,7 +468,6 @@ def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
                 display_snip = ("..." if start_idx > 0 else "") + content[start_idx:end_idx] + ("..." if end_idx < len(content) else "")
                 console.print(Panel(display_snip or content, title="Actual", border_style="yellow"))
 
-
 def try_handle_add_command(user_input: str) -> bool:
     if user_input.strip().lower().startswith(ADD_COMMAND_PREFIX):
         path_to_add = user_input[len(ADD_COMMAND_PREFIX):].strip()
@@ -333,7 +480,7 @@ def try_handle_add_command(user_input: str) -> bool:
                 add_directory_to_conversation(normalized_path)
             else:
                 content = read_local_file(normalized_path)
-                conversation_history.append({"role": "system", "content": f"User added file '{normalized_path}'. Content:\n\n{content}"})
+                add_file_context_smartly(conversation_history, normalized_path, content)
                 console.print(f"[bold blue]✓[/bold blue] Added file '[bright_cyan]{normalized_path}[/bright_cyan]' to conversation.\n")
         except (OSError, ValueError) as e:
             console.print(f"[bold red]✗[/bold red] Could not add path '[bright_cyan]{path_to_add}[/bright_cyan]': {e}\n")
@@ -392,6 +539,44 @@ def try_handle_clear_command(user_input: str) -> bool:
         return True
     return False
 
+def try_handle_folder_command(user_input: str) -> bool:
+    global base_dir
+    if user_input.strip().lower().startswith("/folder"):
+        folder_path = user_input[len("/folder"):].strip()
+        if not folder_path:
+            console.print(f"[yellow]Current base directory: '{base_dir}'[/yellow]")
+            console.print("[yellow]Usage: /folder <path> or /folder reset[/yellow]")
+            return True
+        if folder_path.lower() == "reset":
+            old_base = base_dir
+            base_dir = Path.cwd()
+            console.print(f"[green]✓ Base directory reset from '{old_base}' to: '{base_dir}'[/green]")
+            return True
+        try:
+            new_base = Path(folder_path).resolve()
+            if not new_base.exists() or not new_base.is_dir():
+                console.print(f"[red]✗ Path does not exist or is not a directory: '{folder_path}'[/red]")
+                return True
+            # Check write permissions
+            test_file = new_base / ".eng-git-test"
+            try:
+                test_file.touch()
+                test_file.unlink()
+            except PermissionError:
+                console.print(f"[red]✗ No write permissions in directory: '{new_base}'[/red]")
+                return True
+            old_base = base_dir
+            base_dir = new_base
+            console.print(f"[green]✓ Base directory changed from '{old_base}' to: '{base_dir}'[/green]")
+            console.print(f"[green]  All relative paths will now be resolved against this directory.[/green]")
+            # Automatically trigger /add for the new directory
+            add_directory_to_conversation(str(new_base))
+            return True
+        except Exception as e:
+            console.print(f"[red]✗ Error setting base directory: {e}[/red]")
+            return True
+    return False
+
 def try_handle_exit_command(user_input: str) -> bool:
     if user_input.strip().lower() in ("/exit", "/quit"):
         console.print("[bold blue]👋 Goodbye![/bold blue]")
@@ -402,15 +587,25 @@ def try_handle_help_command(user_input: str) -> bool:
     if user_input.strip().lower() == "/help":
         help_table = Table(title="📝 Available Commands", show_header=True, header_style="bold bright_blue")
         help_table.add_column("Command", style="bright_cyan"); help_table.add_column("Description", style="white")
-        help_table.add_row(f"{ADD_COMMAND_PREFIX.strip()} <path>", "Add file/dir to context")
-        help_table.add_row(f"{COMMIT_COMMAND_PREFIX.strip()} [msg]", "Stage all & commit (prompts if no msg)")
-        help_table.add_row("/git init", "Initialize Git repo")
-        help_table.add_row(f"{GIT_BRANCH_COMMAND_PREFIX.strip()} <name>", "Create & switch branch")
-        help_table.add_row("/git status", "Show Git status")
-        help_table.add_row("/git-info", "Show Git capabilities")
-        help_table.add_row("/clear", "Clear screen")
-        help_table.add_row("/exit, /quit", "Exit")
+        
+        # General commands
         help_table.add_row("/help", "Show this help")
+        help_table.add_row("/clear", "Clear screen")
+        help_table.add_row("/exit, /quit", "Exit application")
+        
+        # Directory & file management
+        help_table.add_row("/folder", "Show current base directory")
+        help_table.add_row("/folder <path>", "Set base directory for file operations")
+        help_table.add_row("/folder reset", "Reset base directory to current working directory")
+        help_table.add_row(f"{ADD_COMMAND_PREFIX.strip()} <path>", "Add file/dir to conversation context")
+        
+        # Git workflow commands
+        help_table.add_row("/git init", "Initialize Git repository")
+        help_table.add_row("/git status", "Show Git status")
+        help_table.add_row(f"{GIT_BRANCH_COMMAND_PREFIX.strip()} <name>", "Create & switch to new branch")
+        help_table.add_row(f"{COMMIT_COMMAND_PREFIX.strip()} [msg]", "Stage all files & commit (prompts if no message)")
+        help_table.add_row("/git-info", "Show detailed Git capabilities")
+        
         console.print(help_table)
         return True
     return False
@@ -433,14 +628,13 @@ def add_directory_to_conversation(directory_path: str):
                     if is_binary_file(full_path): skipped.append(f"{full_path} (binary)"); continue
                     norm_path = normalize_path(full_path)
                     content = read_local_file(norm_path)
-                    conversation_history.append({"role": "system", "content": f"User added (dir scan) '{norm_path}'. Content:\n\n{content}"})
+                    add_file_context_smartly(conversation_history, norm_path, content)
                     added.append(norm_path); total_processed += 1
                 except (OSError, ValueError) as e: skipped.append(f"{full_path} (error: {e})")
         console.print(f"[bold blue]✓[/bold blue] Added folder '[bright_cyan]{directory_path}[/bright_cyan]'.")
         if added: console.print(f"\n[bold bright_blue]📁 Added:[/bold bright_blue] ({len(added)} of {total_processed} valid) {[Path(f).name for f in added[:5]]}{'...' if len(added) > 5 else ''}")
         if skipped: console.print(f"\n[yellow]⏭ Skipped:[/yellow] ({len(skipped)}) {[Path(f).name for f in skipped[:3]]}{'...' if len(skipped) > 3 else ''}")
         console.print()
-
 
 def is_binary_file(file_path: str, peek_size: int = 1024) -> bool:
     try:
@@ -452,9 +646,9 @@ def ensure_file_in_context(file_path: str) -> bool:
     try:
         normalized_path = normalize_path(file_path)
         content = read_local_file(normalized_path)
-        marker = f"Content of file '{normalized_path}'"
+        marker = f"User added file '{normalized_path}'"
         if not any(msg["role"] == "system" and marker in msg["content"] for msg in conversation_history):
-            conversation_history.append({"role": "system", "content": f"{marker}:\n\n{content}"})
+            add_file_context_smartly(conversation_history, normalized_path, content)
         return True
     except (OSError, ValueError) as e:
         console.print(f"[red]✗ Error reading file for context '{file_path}': {e}[/red]")
@@ -463,14 +657,29 @@ def ensure_file_in_context(file_path: str) -> bool:
 def normalize_path(path_str: str) -> str:
     try:
         p = Path(path_str)
-        if p.exists() or p.is_symlink(): 
-             resolved_p = p.resolve(strict=True) 
+        
+        # If path is absolute, use it as-is
+        if p.is_absolute():
+            if p.exists() or p.is_symlink(): 
+                resolved_p = p.resolve(strict=True) 
+            else:
+                resolved_p = p.resolve()
         else:
-             resolved_p = Path(os.path.abspath(str(p))).resolve() 
+            # For relative paths, resolve against base_dir instead of cwd
+            base_path = base_dir / p
+            if base_path.exists() or base_path.is_symlink():
+                resolved_p = base_path.resolve(strict=True)
+            else:
+                resolved_p = base_path.resolve()
+                
     except (FileNotFoundError, RuntimeError): 
-        resolved_p = Path(os.path.abspath(str(path_str))).resolve()
+        # Fallback: resolve relative to base_dir
+        p = Path(path_str)
+        if p.is_absolute():
+            resolved_p = p.resolve()
+        else:
+            resolved_p = (base_dir / p).resolve()
     return str(resolved_p)
-
 
 def create_gitignore():
     gitignore_path = Path(".gitignore")
@@ -488,7 +697,6 @@ def create_gitignore():
         console.print(f"[green]✓ Created .gitignore ({len(patterns)} patterns)[/green]")
         if git_context['enabled']: stage_file(str(gitignore_path))
     except OSError as e: console.print(f"[red]✗ Error creating .gitignore: {e}[/red]")
-
 
 def stage_file(file_path_str: str) -> bool:
     if not git_context['enabled'] or git_context['skip_staging']: return False
@@ -510,7 +718,6 @@ def stage_file(file_path_str: str) -> bool:
         console.print(f"[red]✗ Error staging {file_path_str}: {e}[/red]")
         return False
 
-
 def get_git_status_porcelain() -> Tuple[bool, List[Tuple[str, str]]]:
     if not git_context['enabled']: return False, []
     try:
@@ -525,7 +732,6 @@ def get_git_status_porcelain() -> Tuple[bool, List[Tuple[str, str]]]:
         console.print("[red]Git not found.[/red]")
         git_context['enabled'] = False
         return False, []
-
 
 def user_commit_changes(message: str) -> bool:
     if not git_context['enabled']: 
@@ -557,7 +763,6 @@ def user_commit_changes(message: str) -> bool:
             git_context['enabled'] = False
         return False
 
-
 def initialize_git_repo_cmd() -> bool:
     if Path(".git").exists(): 
         console.print("[yellow]Git repo already exists.[/yellow]")
@@ -581,7 +786,6 @@ def initialize_git_repo_cmd() -> bool:
         if isinstance(e, FileNotFoundError): 
             git_context['enabled'] = False
         return False
-
 
 def create_git_branch_cmd(branch_name: str) -> bool:
     if not git_context['enabled']: 
@@ -609,7 +813,6 @@ def create_git_branch_cmd(branch_name: str) -> bool:
         if isinstance(e, FileNotFoundError): 
             git_context['enabled'] = False
         return False
-
 
 def show_git_status_cmd() -> bool:
     if not git_context['enabled']: 
@@ -660,7 +863,6 @@ def llm_git_init() -> str:
             git_context['enabled'] = False
         return f"Failed to initialize Git repository: {e}"
 
-
 def llm_git_add(file_paths: List[str]) -> str:
     if not git_context['enabled']: return "Git not initialized."
     if not file_paths: return "No file paths to stage."
@@ -681,7 +883,6 @@ def llm_git_add(file_paths: List[str]) -> str:
     if failed_stage: res.append(f"Failed to stage: {', '.join(str(Path(p).name if isinstance(p,str) else p) for p in failed_stage)}")
     return ". ".join(res) + "." if res else "No files staged. Check paths."
 
-
 def llm_git_commit(message: str) -> str:
     if not git_context['enabled']: return "Git not initialized."
     if not message: return "Commit message empty."
@@ -700,7 +901,6 @@ def llm_git_commit(message: str) -> str:
     except Exception as e: 
         console.print_exception()
         return f"Unexpected commit error: {e}"
-
 
 def llm_git_create_branch(branch_name: str) -> str:
     if not git_context['enabled']: return "Git not initialized."
@@ -721,7 +921,6 @@ def llm_git_create_branch(branch_name: str) -> str:
         if isinstance(e, FileNotFoundError):
             git_context['enabled'] = False
         return f"Branch op failed for '{bn}': {e}"
-
 
 def llm_git_status() -> str:
     if not git_context['enabled']: return "Git not initialized."
@@ -812,7 +1011,7 @@ conversation_history: List[Dict[str, Any]] = [
 ]
 
 # --------------------------------------------------------------------------------
-# 6. Main loop
+# 6. Main loop (FIXED)
 # --------------------------------------------------------------------------------
 def main_loop():
     global conversation_history
@@ -829,6 +1028,7 @@ def main_loop():
             if try_handle_git_command(user_input): continue
             if try_handle_git_info_command(user_input): continue
             if try_handle_clear_command(user_input): continue
+            if try_handle_folder_command(user_input): continue
             if try_handle_exit_command(user_input): continue
             if try_handle_help_command(user_input): continue
             
@@ -855,35 +1055,37 @@ def main_loop():
                     full_response_content += content_part
                 
                 if delta.tool_calls:
-                    for tool_call_chunk in delta.tool_calls: # Corrected: No inline type hint
+                    for tool_call_chunk in delta.tool_calls:
                         idx = tool_call_chunk.index
                         while len(accumulated_tool_calls) <= idx:
                             accumulated_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                         
                         current_tool_dict = accumulated_tool_calls[idx]
                         if tool_call_chunk.id: current_tool_dict["id"] = tool_call_chunk.id
-                        if tool_call_chunk.function: # Check if function object exists
+                        if tool_call_chunk.function:
                             if tool_call_chunk.function.name: 
                                 current_tool_dict["function"]["name"] = tool_call_chunk.function.name
                             if tool_call_chunk.function.arguments: 
                                 current_tool_dict["function"]["arguments"] += tool_call_chunk.function.arguments
             console.print()
 
+            # FIXED: Always add assistant message to maintain conversation flow
             assistant_message: Dict[str, Any] = {"role": "assistant"}
-
-            if full_response_content:
-                assistant_message["content"] = full_response_content
             
-            if accumulated_tool_calls:
-                valid_tool_calls = [tc for tc in accumulated_tool_calls if tc.get("id") and tc.get("function", {}).get("name")]
-                if valid_tool_calls:
-                    assistant_message["tool_calls"] = valid_tool_calls
-            
-            if assistant_message.get("content") is not None or assistant_message.get("tool_calls"):
-                conversation_history.append(assistant_message)
+            # Always include content (even if empty) to maintain conversation flow
+            assistant_message["content"] = full_response_content
 
-            if assistant_message.get("tool_calls"):
-                for tool_call_to_exec in assistant_message["tool_calls"]: 
+            # Validate and add tool calls if any
+            valid_tool_calls = validate_tool_calls(accumulated_tool_calls)
+            if valid_tool_calls:
+                assistant_message["tool_calls"] = valid_tool_calls
+            
+            # Always add the assistant message (maintains conversation flow)
+            conversation_history.append(assistant_message)
+
+            # Execute tool calls if any
+            if valid_tool_calls:
+                for tool_call_to_exec in valid_tool_calls: 
                     console.print(Panel(
                         f"[bold blue]Calling:[/bold blue] {tool_call_to_exec['function']['name']}\n"
                         f"[bold blue]Args:[/bold blue] {tool_call_to_exec['function']['arguments']}",
@@ -898,9 +1100,9 @@ def main_loop():
                         "content": tool_output 
                     })
             
-            MAX_HISTORY_MESSAGES = 30
-            if len(conversation_history) > MAX_HISTORY_MESSAGES:
-                conversation_history = [conversation_history[0]] + conversation_history[-(MAX_HISTORY_MESSAGES-1):]
+            # FIXED: Smart truncation that preserves tool call sequences
+            MAX_HISTORY_MESSAGES = 50  # Increased to accommodate tool sequences
+            conversation_history = smart_truncate_history(conversation_history, MAX_HISTORY_MESSAGES)
 
         except KeyboardInterrupt: console.print("\n[yellow]⚠ Interrupted. Ctrl+D or /exit to quit.[/yellow]")
         except EOFError: console.print("[blue]👋 Goodbye! (EOF)[/blue]"); sys.exit(0)
