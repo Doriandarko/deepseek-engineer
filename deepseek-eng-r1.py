@@ -55,6 +55,11 @@ GIT_BRANCH_COMMAND_PREFIX: str = "/git branch "
 # Conversation management
 MAX_HISTORY_MESSAGES: int = 50
 MAX_CONTEXT_FILES: int = 5
+ESTIMATED_MAX_TOKENS: int = 120000  # Conservative estimate for context window
+TOKENS_PER_MESSAGE_ESTIMATE: int = 200  # Average tokens per message
+TOKENS_PER_FILE_KB: int = 300  # Estimated tokens per KB of file content
+CONTEXT_WARNING_THRESHOLD: float = 0.8  # Warn when 80% of context is used
+AGGRESSIVE_TRUNCATION_THRESHOLD: float = 0.9  # More aggressive truncation at 90%
 
 # Model configuration
 DEFAULT_MODEL: str = "deepseek-chat"
@@ -322,21 +327,88 @@ conversation_history: List[Dict[str, Any]] = [
 # 5. CORE UTILITY FUNCTIONS
 # -----------------------------------------------------------------------------
 
-def smart_truncate_history(conversation_history: List[Dict[str, Any]], max_messages: int = MAX_HISTORY_MESSAGES) -> List[Dict[str, Any]]:
+def estimate_token_usage(conversation_history: List[Dict[str, Any]]) -> Tuple[int, Dict[str, int]]:
     """
-    Truncate conversation history while preserving tool call sequences and important context.
+    Estimate token usage for the conversation history.
     
     Args:
         conversation_history: List of conversation messages
-        max_messages: Maximum number of messages to keep
+        
+    Returns:
+        Tuple of (total_estimated_tokens, breakdown_by_role)
+    """
+    token_breakdown = {"system": 0, "user": 0, "assistant": 0, "tool": 0}
+    total_tokens = 0
+    
+    for msg in conversation_history:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        
+        # Basic token estimation: roughly 4 characters per token for English text
+        content_tokens = len(content) // 4
+        
+        # Add extra tokens for tool calls and structured data
+        if msg.get("tool_calls"):
+            content_tokens += len(str(msg["tool_calls"])) // 4
+        if msg.get("tool_call_id"):
+            content_tokens += 10  # Small overhead for tool metadata
+            
+        token_breakdown[role] = token_breakdown.get(role, 0) + content_tokens
+        total_tokens += content_tokens
+    
+    return total_tokens, token_breakdown
+
+def get_context_usage_info() -> Dict[str, Any]:
+    """
+    Get comprehensive context usage information.
+    
+    Returns:
+        Dictionary with context usage statistics
+    """
+    total_tokens, breakdown = estimate_token_usage(conversation_history)
+    file_contexts = sum(1 for msg in conversation_history if msg["role"] == "system" and "User added file" in msg["content"])
+    
+    return {
+        "total_messages": len(conversation_history),
+        "estimated_tokens": total_tokens,
+        "token_usage_percent": (total_tokens / ESTIMATED_MAX_TOKENS) * 100,
+        "file_contexts": file_contexts,
+        "token_breakdown": breakdown,
+        "approaching_limit": total_tokens > (ESTIMATED_MAX_TOKENS * CONTEXT_WARNING_THRESHOLD),
+        "critical_limit": total_tokens > (ESTIMATED_MAX_TOKENS * AGGRESSIVE_TRUNCATION_THRESHOLD)
+    }
+
+def smart_truncate_history(conversation_history: List[Dict[str, Any]], max_messages: int = MAX_HISTORY_MESSAGES) -> List[Dict[str, Any]]:
+    """
+    Truncate conversation history while preserving tool call sequences and important context.
+    Now uses token-based estimation for more intelligent truncation.
+    
+    Args:
+        conversation_history: List of conversation messages
+        max_messages: Maximum number of messages to keep (fallback limit)
         
     Returns:
         Truncated conversation history
     """
-    if len(conversation_history) <= max_messages:
+    # Get current context usage
+    context_info = get_context_usage_info()
+    current_tokens = context_info["estimated_tokens"]
+    
+    # If we're not approaching limits, use message-based truncation
+    if current_tokens < (ESTIMATED_MAX_TOKENS * CONTEXT_WARNING_THRESHOLD) and len(conversation_history) <= max_messages:
         return conversation_history
     
-    # Always keep system prompt at index 0 and any critical system messages
+    # Determine target token count based on current usage
+    if context_info["critical_limit"]:
+        target_tokens = int(ESTIMATED_MAX_TOKENS * 0.6)  # Aggressive reduction
+        console.print(f"[yellow]⚠ Critical context limit reached. Aggressively truncating to ~{target_tokens} tokens.[/yellow]")
+    elif context_info["approaching_limit"]:
+        target_tokens = int(ESTIMATED_MAX_TOKENS * 0.7)  # Moderate reduction
+        console.print(f"[yellow]⚠ Context limit approaching. Truncating to ~{target_tokens} tokens.[/yellow]")
+    else:
+        target_tokens = int(ESTIMATED_MAX_TOKENS * 0.8)  # Gentle reduction
+    
+    # Separate system messages from conversation messages
     system_messages: List[Dict[str, Any]] = []
     other_messages: List[Dict[str, Any]] = []
     
@@ -346,51 +418,98 @@ def smart_truncate_history(conversation_history: List[Dict[str, Any]], max_messa
         else:
             other_messages.append(msg)
     
-    # Keep the main system prompt and recent file context messages
-    if len(system_messages) > 1:
-        # Keep first system message (main prompt) and last few file contexts
-        important_system = [system_messages[0]]
-        file_contexts = [msg for msg in system_messages[1:] if "User added file" in msg["content"]]
-        important_system.extend(file_contexts[-3:])  # Keep last 3 file contexts
-        system_messages = important_system
+    # Always keep the main system prompt
+    essential_system = [system_messages[0]] if system_messages else []
     
-    # Work backwards to find a good truncation point for conversation flow
+    # Handle file context messages more intelligently
+    file_contexts = [msg for msg in system_messages[1:] if "User added file" in msg["content"]]
+    if file_contexts:
+        # Keep most recent and smallest file contexts
+        file_contexts_with_size = []
+        for msg in file_contexts:
+            content_size = len(msg["content"])
+            file_contexts_with_size.append((msg, content_size))
+        
+        # Sort by size (smaller first) and recency (newer first)
+        file_contexts_with_size.sort(key=lambda x: (x[1], -file_contexts.index(x[0])))
+        
+        # Keep up to 3 file contexts that fit within token budget
+        kept_file_contexts = []
+        file_context_tokens = 0
+        max_file_context_tokens = target_tokens // 4  # Reserve 25% for file contexts
+        
+        for msg, size in file_contexts_with_size[:3]:
+            msg_tokens = size // 4
+            if file_context_tokens + msg_tokens <= max_file_context_tokens:
+                kept_file_contexts.append(msg)
+                file_context_tokens += msg_tokens
+            else:
+                break
+        
+        essential_system.extend(kept_file_contexts)
+    
+    # Calculate remaining token budget for conversation messages
+    system_tokens, _ = estimate_token_usage(essential_system)
+    remaining_tokens = target_tokens - system_tokens
+    
+    # Work backwards through conversation messages, preserving tool call sequences
     keep_messages: List[Dict[str, Any]] = []
+    current_token_count = 0
     i = len(other_messages) - 1
-    messages_to_keep = max_messages - len(system_messages)
     
-    while i >= 0 and len(keep_messages) < messages_to_keep:
+    while i >= 0 and current_token_count < remaining_tokens:
         current_msg = other_messages[i]
+        msg_tokens = len(str(current_msg)) // 4
         
         # If this is a tool result, we need to keep the corresponding assistant message
         if current_msg["role"] == "tool":
             # Collect all tool results for this sequence
             tool_sequence: List[Dict[str, Any]] = []
+            tool_sequence_tokens = 0
+            
             while i >= 0 and other_messages[i]["role"] == "tool":
-                tool_sequence.insert(0, other_messages[i])
+                tool_msg = other_messages[i]
+                tool_msg_tokens = len(str(tool_msg)) // 4
+                tool_sequence.insert(0, tool_msg)
+                tool_sequence_tokens += tool_msg_tokens
                 i -= 1
             
-            # Add the tool results
-            keep_messages = tool_sequence + keep_messages
-            
-            # Find and add the corresponding assistant message with tool_calls
+            # Find the corresponding assistant message with tool_calls
+            assistant_msg = None
+            assistant_tokens = 0
             if i >= 0 and other_messages[i]["role"] == "assistant" and other_messages[i].get("tool_calls"):
-                keep_messages.insert(0, other_messages[i])
+                assistant_msg = other_messages[i]
+                assistant_tokens = len(str(assistant_msg)) // 4
                 i -= 1
+            
+            # Check if the complete tool sequence fits in our budget
+            total_sequence_tokens = tool_sequence_tokens + assistant_tokens
+            if current_token_count + total_sequence_tokens <= remaining_tokens:
+                # Add the complete sequence
+                if assistant_msg:
+                    keep_messages.insert(0, assistant_msg)
+                    current_token_count += assistant_tokens
+                keep_messages = tool_sequence + keep_messages
+                current_token_count += tool_sequence_tokens
+            else:
+                # Sequence too large, stop here
+                break
         else:
             # Regular message (user or assistant)
-            keep_messages.insert(0, current_msg)
-            i -= 1
+            if current_token_count + msg_tokens <= remaining_tokens:
+                keep_messages.insert(0, current_msg)
+                current_token_count += msg_tokens
+                i -= 1
+            else:
+                # Message too large, stop here
+                break
     
     # Combine system messages with kept conversation messages
-    result = system_messages + keep_messages
+    result = essential_system + keep_messages
     
-    # Final safety check - if still too long, trim more aggressively but keep recent complete sequences
-    if len(result) > max_messages:
-        excess = len(result) - max_messages
-        # Remove from the middle, keeping system messages and recent conversation
-        system_count = len(system_messages)
-        result = system_messages + keep_messages[excess:]
+    # Log truncation results
+    final_tokens, _ = estimate_token_usage(result)
+    console.print(f"[dim]Context truncated: {len(conversation_history)} → {len(result)} messages, ~{current_tokens} → ~{final_tokens} tokens[/dim]")
     
     return result
 
@@ -437,17 +556,36 @@ def validate_tool_calls(accumulated_tool_calls: List[Dict[str, Any]]) -> List[Di
     
     return valid_calls
 
-def add_file_context_smartly(conversation_history: List[Dict[str, Any]], file_path: str, content: str, max_context_files: int = MAX_CONTEXT_FILES) -> None:
+def add_file_context_smartly(conversation_history: List[Dict[str, Any]], file_path: str, content: str, max_context_files: int = MAX_CONTEXT_FILES) -> bool:
     """
     Add file context while managing system message bloat and avoiding duplicates.
+    Now includes token-aware management and file size limits.
     
     Args:
         conversation_history: List of conversation messages
         file_path: Path to the file being added
         content: Content of the file
         max_context_files: Maximum number of file contexts to keep
+        
+    Returns:
+        True if file was added successfully, False if rejected due to size limits
     """
     marker = f"User added file '{file_path}'"
+    
+    # Check file size and context limits
+    content_size_kb = len(content) / 1024
+    estimated_tokens = len(content) // 4
+    context_info = get_context_usage_info()
+    
+    # Reject very large files that would consume too much context
+    MAX_SINGLE_FILE_TOKENS = ESTIMATED_MAX_TOKENS // 10  # No single file should use more than 10% of context
+    if estimated_tokens > MAX_SINGLE_FILE_TOKENS:
+        console.print(f"[yellow]⚠ File '{file_path}' too large ({content_size_kb:.1f}KB, ~{estimated_tokens} tokens). Consider using smaller files or specific sections.[/yellow]")
+        return False
+    
+    # Warn if adding this file would push us over context limits
+    if context_info["approaching_limit"] and estimated_tokens > 1000:
+        console.print(f"[yellow]⚠ Context approaching limits. Adding large file '{file_path}' ({content_size_kb:.1f}KB) may trigger aggressive truncation.[/yellow]")
     
     # Remove any existing context for this exact file to avoid duplicates
     conversation_history[:] = [
@@ -455,32 +593,43 @@ def add_file_context_smartly(conversation_history: List[Dict[str, Any]], file_pa
         if not (msg["role"] == "system" and marker in msg["content"])
     ]
     
-    # Count existing file context messages
-    file_context_count = sum(
-        1 for msg in conversation_history 
-        if msg["role"] == "system" and "User added file" in msg["content"]
-    )
+    # Get current file contexts and their sizes
+    file_contexts = []
+    for msg in conversation_history:
+        if msg["role"] == "system" and "User added file" in msg["content"]:
+            # Extract file path from marker
+            lines = msg["content"].split("\n", 1)
+            if lines:
+                context_file_path = lines[0].replace("User added file '", "").replace("'. Content:", "")
+                context_size = len(msg["content"])
+                file_contexts.append((msg, context_file_path, context_size))
     
-    # If too many file contexts, remove oldest ones (but keep the main system prompt)
-    if file_context_count >= max_context_files:
-        removed_count = 0
-        new_history: List[Dict[str, Any]] = []
+    # If we're at the file limit, remove the largest or oldest file contexts
+    while len(file_contexts) >= max_context_files:
+        if context_info["approaching_limit"]:
+            # Remove largest file context when approaching limits
+            file_contexts.sort(key=lambda x: x[2], reverse=True)  # Sort by size, largest first
+            to_remove = file_contexts.pop(0)
+            console.print(f"[dim]Removed large file context: {Path(to_remove[1]).name} ({to_remove[2]//1024:.1f}KB)[/dim]")
+        else:
+            # Remove oldest file context normally
+            to_remove = file_contexts.pop(0)
+            console.print(f"[dim]Removed old file context: {Path(to_remove[1]).name}[/dim]")
         
-        for msg in conversation_history:
-            if (msg["role"] == "system" and 
-                "User added file" in msg["content"] and 
-                removed_count < (file_context_count - max_context_files + 1)):
-                removed_count += 1
-                continue  # Skip this old file context
-            new_history.append(msg)
-        
-        conversation_history[:] = new_history
+        # Remove from conversation history
+        conversation_history[:] = [msg for msg in conversation_history if msg != to_remove[0]]
     
     # Add new file context
-    conversation_history.append({
+    new_context_msg = {
         "role": "system", 
         "content": f"{marker}. Content:\n\n{content}"
-    })
+    }
+    conversation_history.append(new_context_msg)
+    
+    # Log the addition
+    console.print(f"[dim]Added file context: {Path(file_path).name} ({content_size_kb:.1f}KB, ~{estimated_tokens} tokens)[/dim]")
+    
+    return True
 
 def read_local_file(file_path: str) -> str:
     """
@@ -569,7 +718,7 @@ def ensure_file_in_context(file_path: str) -> bool:
         content = read_local_file(normalized_path)
         marker = f"User added file '{normalized_path}'"
         if not any(msg["role"] == "system" and marker in msg["content"] for msg in conversation_history):
-            add_file_context_smartly(conversation_history, normalized_path, content)
+            return add_file_context_smartly(conversation_history, normalized_path, content)
         return True
     except (OSError, ValueError) as e:
         console.print(f"[red]✗ Error reading file for context '{file_path}': {e}[/red]")
@@ -586,7 +735,7 @@ def get_model_indicator() -> str:
 
 def get_prompt_indicator() -> str:
     """
-    Get the full prompt indicator including git and model status.
+    Get the full prompt indicator including git, model, and context status.
     
     Returns:
         Formatted prompt indicator string
@@ -600,8 +749,14 @@ def get_prompt_indicator() -> str:
     if git_context['enabled'] and git_context['branch']:
         indicators.append(f"🌳 {git_context['branch']}")
     
-    # Add base prompt
-    indicators.append("🔵")
+    # Add context status indicator
+    context_info = get_context_usage_info()
+    if context_info["critical_limit"]:
+        indicators.append("🔴")  # Critical context usage
+    elif context_info["approaching_limit"]:
+        indicators.append("🟡")  # Warning context usage
+    else:
+        indicators.append("🔵")  # Normal context usage
     
     return " ".join(indicators)
 
@@ -736,8 +891,10 @@ def add_directory_to_conversation(directory_path: str) -> None:
                         
                     norm_path = normalize_path(full_path)
                     content = read_local_file(norm_path)
-                    add_file_context_smartly(conversation_history, norm_path, content)
-                    added.append(norm_path)
+                    if add_file_context_smartly(conversation_history, norm_path, content):
+                        added.append(norm_path)
+                    else:
+                        skipped.append(f"{full_path} (too large for context)")
                     total_processed += 1
                 except (OSError, ValueError) as e: 
                     skipped.append(f"{full_path} (error: {e})")
@@ -902,8 +1059,10 @@ def try_handle_add_command(user_input: str) -> bool:
                 add_directory_to_conversation(normalized_path)
             else:
                 content = read_local_file(normalized_path)
-                add_file_context_smartly(conversation_history, normalized_path, content)
-                console.print(f"[bold blue]✓[/bold blue] Added file '[bright_cyan]{normalized_path}[/bright_cyan]' to conversation.\n")
+                if add_file_context_smartly(conversation_history, normalized_path, content):
+                    console.print(f"[bold blue]✓[/bold blue] Added file '[bright_cyan]{normalized_path}[/bright_cyan]' to conversation.\n")
+                else:
+                    console.print(f"[bold yellow]⚠[/bold yellow] File '[bright_cyan]{normalized_path}[/bright_cyan]' too large for context.\n")
         except (OSError, ValueError) as e:
             console.print(f"[bold red]✗[/bold red] Could not add path '[bright_cyan]{path_to_add}[/bright_cyan]': {e}\n")
         return True
@@ -1085,6 +1244,82 @@ def try_handle_exit_command(user_input: str) -> bool:
         sys.exit(0)
     return False
 
+def try_handle_context_command(user_input: str) -> bool:
+    """Handle /context command to show context usage statistics."""
+    if user_input.strip().lower() == "/context":
+        context_info = get_context_usage_info()
+        
+        # Create context usage table
+        context_table = Table(title="📊 Context Usage Statistics", show_header=True, header_style="bold bright_blue")
+        context_table.add_column("Metric", style="bright_cyan")
+        context_table.add_column("Value", style="white")
+        context_table.add_column("Status", style="white")
+        
+        # Add rows with usage information
+        context_table.add_row(
+            "Total Messages", 
+            str(context_info["total_messages"]), 
+            "📝"
+        )
+        context_table.add_row(
+            "Estimated Tokens", 
+            f"{context_info['estimated_tokens']:,}", 
+            f"{context_info['token_usage_percent']:.1f}% of {ESTIMATED_MAX_TOKENS:,}"
+        )
+        context_table.add_row(
+            "File Contexts", 
+            str(context_info["file_contexts"]), 
+            f"Max: {MAX_CONTEXT_FILES}"
+        )
+        
+        # Status indicators
+        if context_info["critical_limit"]:
+            status_color = "red"
+            status_text = "🔴 Critical - aggressive truncation active"
+        elif context_info["approaching_limit"]:
+            status_color = "yellow"
+            status_text = "🟡 Warning - approaching limits"
+        else:
+            status_color = "green"
+            status_text = "🟢 Healthy - plenty of space"
+        
+        context_table.add_row(
+            "Context Health", 
+            status_text, 
+            ""
+        )
+        
+        console.print(context_table)
+        
+        # Show token breakdown
+        if context_info["token_breakdown"]:
+            breakdown_table = Table(title="📋 Token Breakdown by Role", show_header=True, header_style="bold bright_blue", border_style="blue")
+            breakdown_table.add_column("Role", style="bright_cyan")
+            breakdown_table.add_column("Tokens", style="white")
+            breakdown_table.add_column("Percentage", style="white")
+            
+            total_tokens = context_info["estimated_tokens"]
+            for role, tokens in context_info["token_breakdown"].items():
+                if tokens > 0:
+                    percentage = (tokens / total_tokens * 100) if total_tokens > 0 else 0
+                    breakdown_table.add_row(
+                        role.capitalize(),
+                        f"{tokens:,}",
+                        f"{percentage:.1f}%"
+                    )
+            
+            console.print(breakdown_table)
+        
+        # Show recommendations if approaching limits
+        if context_info["approaching_limit"]:
+            console.print("\n[yellow]💡 Recommendations to manage context:[/yellow]")
+            console.print("[yellow]  • Use /clear-context to start fresh[/yellow]")
+            console.print("[yellow]  • Remove large files from context[/yellow]")
+            console.print("[yellow]  • Work with smaller file sections[/yellow]")
+        
+        return True
+    return False
+
 def try_handle_help_command(user_input: str) -> bool:
     """Handle /help command to show available commands."""
     if user_input.strip().lower() == "/help":
@@ -1098,6 +1333,7 @@ def try_handle_help_command(user_input: str) -> bool:
         help_table.add_row("/reasoner", "Toggle between chat and reasoner models")
         help_table.add_row("/clear", "Clear screen")
         help_table.add_row("/clear-context", "Clear conversation context")
+        help_table.add_row("/context", "Show context usage statistics")
         help_table.add_row("/exit, /quit", "Exit application")
         
         # Directory & file management
@@ -1462,12 +1698,20 @@ def main_loop() -> None:
             if try_handle_reasoner_command(user_input): continue
             if try_handle_clear_command(user_input): continue
             if try_handle_clear_context_command(user_input): continue
+            if try_handle_context_command(user_input): continue
             if try_handle_folder_command(user_input): continue
             if try_handle_exit_command(user_input): continue
             if try_handle_help_command(user_input): continue
             
             # Add user message to conversation
             conversation_history.append({"role": "user", "content": user_input})
+            
+            # Check context usage and warn if necessary
+            context_info = get_context_usage_info()
+            if context_info["critical_limit"] and len(conversation_history) % 10 == 0:  # Warn every 10 messages when critical
+                console.print(f"[red]⚠ Context critical: {context_info['token_usage_percent']:.1f}% used. Consider /clear-context or /context for details.[/red]")
+            elif context_info["approaching_limit"] and len(conversation_history) % 20 == 0:  # Warn every 20 messages when approaching
+                console.print(f"[yellow]⚠ Context high: {context_info['token_usage_percent']:.1f}% used. Use /context for details.[/yellow]")
             
             # Determine which model to use
             current_model = model_context['current_model']
@@ -1525,8 +1769,9 @@ def main_loop() -> None:
             # Always add the assistant message (maintains conversation flow)
             conversation_history.append(assistant_message)
 
-            # Execute tool calls if any
+            # Execute tool calls and allow assistant to continue naturally
             if valid_tool_calls:
+                # Execute all tool calls first
                 for tool_call_to_exec in valid_tool_calls: 
                     console.print(Panel(
                         f"[bold blue]Calling:[/bold blue] {tool_call_to_exec['function']['name']}\n"
@@ -1541,6 +1786,87 @@ def main_loop() -> None:
                         "name": tool_call_to_exec["function"]["name"],
                         "content": tool_output 
                     })
+                
+                # Now let the assistant continue with the tool results
+                # This creates a natural conversation flow where the assistant processes the results
+                max_continuation_rounds = 3
+                current_round = 0
+                
+                while current_round < max_continuation_rounds:
+                    current_round += 1
+                    
+                    with console.status(f"[bold yellow]{model_name} is processing results...[/bold yellow]", spinner="dots"):
+                        continue_response_stream: Stream[ChatCompletionChunk] = client.chat.completions.create(
+                            model=current_model,
+                            messages=conversation_history, # type: ignore 
+                            tools=tools, # type: ignore 
+                            tool_choice="auto",
+                            stream=True
+                        )
+                    
+                    # Process the continuation response
+                    continuation_content = ""
+                    continuation_tool_calls: List[Dict[str, Any]] = []
+                    
+                    console.print(f"[bold bright_magenta]🤖 {model_name}:[/bold bright_magenta] ", end="")
+                    for chunk in continue_response_stream:
+                        delta: ChoiceDelta = chunk.choices[0].delta
+                        if delta.content:
+                            content_part = delta.content
+                            console.print(content_part, end="", style="bright_magenta")
+                            continuation_content += content_part
+                        
+                        if delta.tool_calls:
+                            for tool_call_chunk in delta.tool_calls:
+                                idx = tool_call_chunk.index
+                                while len(continuation_tool_calls) <= idx:
+                                    continuation_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                
+                                current_tool_dict = continuation_tool_calls[idx]
+                                if tool_call_chunk.id: 
+                                    current_tool_dict["id"] = tool_call_chunk.id
+                                if tool_call_chunk.function:
+                                    if tool_call_chunk.function.name: 
+                                        current_tool_dict["function"]["name"] = tool_call_chunk.function.name
+                                    if tool_call_chunk.function.arguments: 
+                                        current_tool_dict["function"]["arguments"] += tool_call_chunk.function.arguments
+                    console.print()
+                    
+                    # Add the continuation response to conversation history
+                    continuation_message: Dict[str, Any] = {"role": "assistant", "content": continuation_content}
+                    
+                    # Check if there are more tool calls to execute
+                    valid_continuation_tools = validate_tool_calls(continuation_tool_calls)
+                    if valid_continuation_tools:
+                        continuation_message["tool_calls"] = valid_continuation_tools
+                        conversation_history.append(continuation_message)
+                        
+                        # Execute the additional tool calls
+                        for tool_call_to_exec in valid_continuation_tools:
+                            console.print(Panel(
+                                f"[bold blue]Calling:[/bold blue] {tool_call_to_exec['function']['name']}\n"
+                                f"[bold blue]Args:[/bold blue] {tool_call_to_exec['function']['arguments']}",
+                                title="🛠️ Function Call", border_style="yellow", expand=False
+                            ))
+                            tool_output = execute_function_call_dict(tool_call_to_exec)
+                            console.print(Panel(tool_output, title=f"↪️ Output of {tool_call_to_exec['function']['name']}", border_style="green", expand=False))
+                            conversation_history.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call_to_exec["id"],
+                                "name": tool_call_to_exec["function"]["name"],
+                                "content": tool_output
+                            })
+                        
+                        # Continue the loop to let assistant process these new results
+                        continue
+                    else:
+                        # No more tool calls, add the final response and break
+                        conversation_history.append(continuation_message)
+                        break
+                
+                # If we hit the max rounds, warn about it
+                if current_round >= max_continuation_rounds:
+                    console.print(f"[yellow]⚠ Reached maximum continuation rounds ({max_continuation_rounds}). Conversation continues.[/yellow]")
             
             # Smart truncation that preserves tool call sequences
             conversation_history = smart_truncate_history(conversation_history, MAX_HISTORY_MESSAGES)
