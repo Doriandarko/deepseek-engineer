@@ -267,11 +267,28 @@ tools: List[Dict[str, Any]] = [
                 "required": ["file_paths"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_powershell",
+            "description": "Run a PowerShell command and return its output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The PowerShell command to execute"
+                    }
+                },
+                "required": ["command"]
+            }
+        }
     }
-]
+]  # <-- This closes the tools list
 
 # System prompt
-SYSTEM_PROMPT: str = dedent("""\
+SYSTEM_PROMPT: str = dedent("""
     You are an elite software engineer called DeepSeek Engineer with decades of experience across all programming domains.
     Your expertise spans system design, algorithms, testing, and best practices.
     You provide thoughtful, well-structured solutions while explaining your reasoning.
@@ -313,11 +330,10 @@ SYSTEM_PROMPT: str = dedent("""\
     6. Suggest tests or validation steps when appropriate
     7. Be thorough in your analysis and recommendations
 
-    IMPORTANT: In your thinking process, if you realize that something requires a tool call, cut your thinking short and proceed directly to the tool call. Don't overthink - act efficiently when file or Git operations are needed.
+    IMPORTANT: In your thinking process, if you realize that something requires a tool call, cut your thinking short and proceed directly to the tool call. Don't overthink - act efficiently when file operations are needed.
 
     Remember: You're a senior engineer - be thoughtful, precise, and explain your reasoning clearly.
 """)
-
 # Conversation history
 conversation_history: List[Dict[str, Any]] = [
     {"role": "system", "content": SYSTEM_PROMPT}
@@ -560,39 +576,35 @@ def add_file_context_smartly(conversation_history: List[Dict[str, Any]], file_pa
     """
     Add file context while managing system message bloat and avoiding duplicates.
     Now includes token-aware management and file size limits.
-    
+
     Args:
         conversation_history: List of conversation messages
         file_path: Path to the file being added
         content: Content of the file
         max_context_files: Maximum number of file contexts to keep
-        
+
     Returns:
         True if file was added successfully, False if rejected due to size limits
     """
     marker = f"User added file '{file_path}'"
-    
+
     # Check file size and context limits
     content_size_kb = len(content) / 1024
     estimated_tokens = len(content) // 4
     context_info = get_context_usage_info()
-    
-    # Reject very large files that would consume too much context
-    MAX_SINGLE_FILE_TOKENS = ESTIMATED_MAX_TOKENS // 10  # No single file should use more than 10% of context
+
+    # Only reject files that would use more than 80% of context
+    MAX_SINGLE_FILE_TOKENS = int(ESTIMATED_MAX_TOKENS * 0.8)
     if estimated_tokens > MAX_SINGLE_FILE_TOKENS:
-        console.print(f"[yellow]⚠ File '{file_path}' too large ({content_size_kb:.1f}KB, ~{estimated_tokens} tokens). Consider using smaller files or specific sections.[/yellow]")
+        console.print(f"[yellow]⚠ File '{file_path}' too large ({content_size_kb:.1f}KB, ~{estimated_tokens} tokens). Limit is 80% of context window.[/yellow]")
         return False
-    
-    # Warn if adding this file would push us over context limits
-    if context_info["approaching_limit"] and estimated_tokens > 1000:
-        console.print(f"[yellow]⚠ Context approaching limits. Adding large file '{file_path}' ({content_size_kb:.1f}KB) may trigger aggressive truncation.[/yellow]")
-    
+
     # Remove any existing context for this exact file to avoid duplicates
     conversation_history[:] = [
         msg for msg in conversation_history 
         if not (msg["role"] == "system" and marker in msg["content"])
     ]
-    
+
     # Get current file contexts and their sizes
     file_contexts = []
     for msg in conversation_history:
@@ -603,7 +615,7 @@ def add_file_context_smartly(conversation_history: List[Dict[str, Any]], file_pa
                 context_file_path = lines[0].replace("User added file '", "").replace("'. Content:", "")
                 context_size = len(msg["content"])
                 file_contexts.append((msg, context_file_path, context_size))
-    
+
     # If we're at the file limit, remove the largest or oldest file contexts
     while len(file_contexts) >= max_context_files:
         if context_info["approaching_limit"]:
@@ -615,20 +627,20 @@ def add_file_context_smartly(conversation_history: List[Dict[str, Any]], file_pa
             # Remove oldest file context normally
             to_remove = file_contexts.pop(0)
             console.print(f"[dim]Removed old file context: {Path(to_remove[1]).name}[/dim]")
-        
+
         # Remove from conversation history
         conversation_history[:] = [msg for msg in conversation_history if msg != to_remove[0]]
-    
+
     # Add new file context
     new_context_msg = {
         "role": "system", 
         "content": f"{marker}. Content:\n\n{content}"
     }
     conversation_history.append(new_context_msg)
-    
+
     # Log the addition
     console.print(f"[dim]Added file context: {Path(file_path).name} ({content_size_kb:.1f}KB, ~{estimated_tokens} tokens)[/dim]")
-    
+
     return True
 
 def read_local_file(file_path: str) -> str:
@@ -648,6 +660,24 @@ def read_local_file(file_path: str) -> str:
     full_path = (base_dir / file_path).resolve()
     with open(full_path, "r", encoding="utf-8") as f:
         return f.read()
+
+def run_powershell_command(command: str) -> Tuple:
+    """Run a PowerShell command and return (stdout, stderr)."""
+    # Check OS
+    os_check = subprocess.run(
+        ["powershell", "-Command", "$PSVersionTable.PSEdition"],
+        capture_output=True,
+        text=True
+    )
+    os_info = os_check.stdout.strip() if os_check.returncode == 0 else "Unknown OS"
+    console.print(f"[dim]Running PowerShell on: {os_info}[/dim]")
+
+    completed = subprocess.run(
+        ["powershell", "-Command", command],
+        capture_output=True,
+        text=True
+    )
+    return completed.stdout, completed.stderr
 
 def normalize_path(path_str: str) -> str:
     """
@@ -780,8 +810,8 @@ def create_file(path: str, content: str) -> None:
         raise ValueError("Home directory references not allowed")
     normalized_path_str = normalize_path(str(file_path)) 
     
-    if len(content) > MAX_FILE_CONTENT_SIZE_CREATE:
-        raise ValueError(f"File content exceeds {MAX_FILE_CONTENT_SIZE_CREATE // (1024*1024)}MB size limit")
+    #if len(content) > MAX_FILE_CONTENT_SIZE_CREATE:
+    #    raise ValueError(f"File content exceeds {MAX_FILE_CONTENT_SIZE_CREATE // (1024*1024)}MB size limit")
     
     Path(normalized_path_str).parent.mkdir(parents=True, exist_ok=True)
     with open(normalized_path_str, "w", encoding="utf-8") as f:
@@ -882,9 +912,10 @@ def add_directory_to_conversation(directory_path: str) -> None:
                     
                 full_path = os.path.join(root, file)
                 try:
-                    if os.path.getsize(full_path) > MAX_FILE_SIZE_IN_ADD_DIR: 
-                        skipped.append(f"{full_path} (size limit)")
-                        continue
+                    # REMOVE this check:
+                    # if os.path.getsize(full_path) > MAX_FILE_SIZE_IN_ADD_DIR: 
+                    #     skipped.append(f"{full_path} (size limit)")
+                    #     continue
                     if is_binary_file(full_path): 
                         skipped.append(f"{full_path} (binary)")
                         continue
@@ -1467,7 +1498,7 @@ def llm_git_init() -> str:
         git_context['enabled'] = True
         return "Git repository already exists."
     try:
-        subprocess.run(["git", "init"], cwd=str(Path.cwd()), check=True, capture_output=True, text=True)
+        subprocess.run(["git", "init"], cwd=str(Path.cwd()), check=True, capture_output=True)
         git_context['enabled'] = True
         branch_res = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(Path.cwd()), capture_output=True, text=True)
         git_context['branch'] = branch_res.stdout.strip() if branch_res.returncode == 0 else "main"
@@ -1652,6 +1683,7 @@ def execute_function_call_dict(tool_call_dict: Dict[str, Any]) -> str:
         elif func_name == "git_init": 
             return llm_git_init()
         elif func_name == "git_add": 
+ 
             return llm_git_add(args.get("file_paths", []))
         elif func_name == "git_commit": 
             return llm_git_commit(args.get("message", "Auto commit"))
@@ -1659,6 +1691,22 @@ def execute_function_call_dict(tool_call_dict: Dict[str, Any]) -> str:
             return llm_git_create_branch(args.get("branch_name", ""))
         elif func_name == "git_status": 
             return llm_git_status()
+        elif func_name == "run_powershell":
+            command = args["command"]
+            output, error = run_powershell_command(command)
+            if error:
+                return f"PowerShell Error:\n{error}"
+            return f"PowerShell Output:\n{output}"
+        elif func_name == "run_bash":
+            command = args["command"]
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True
+            )
+            if completed.stderr:
+                return f"Bash Error:\n{completed.stderr}"
+            return f"Bash Output:\n{completed.stdout}"
         else: 
             return f"Unknown LLM function: {func_name}"
             
