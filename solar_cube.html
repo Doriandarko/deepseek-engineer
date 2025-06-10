@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Solar System in a Rotating Cube</title>
+    <title>Astonishing 3D Solar System in a Rotating Cube</title>
     <style>
         body {
             margin: 0;
@@ -14,14 +14,37 @@
             align-items: center;
             height: 100vh;
             perspective: 1200px;
+            font-family: 'Arial', sans-serif;
+        }
+        
+        /* Starfield background */
+        .stars {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+        }
+        
+        .star {
+            position: absolute;
+            background: #fff;
+            border-radius: 50%;
+            animation: twinkle var(--duration, 5s) infinite ease-in-out;
+        }
+        
+        @keyframes twinkle {
+            0%, 100% { opacity: 0.1; }
+            50% { opacity: 1; }
         }
         
         .scene {
             position: relative;
-            width: 300px;
-            height: 300px;
+            width: 500px;
+            height: 500px;
             transform-style: preserve-3d;
-            animation: rotateCube 30s infinite linear;
+            animation: rotateCube 40s infinite linear;
         }
         
         .cube {
@@ -33,52 +56,76 @@
         
         .face {
             position: absolute;
-            width: 300px;
-            height: 300px;
-            border: 2px solid rgba(255, 255, 255, 0.2);
+            width: 500px;
+            height: 500px;
+            border: 1px solid rgba(100, 180, 255, 0.15);
             box-sizing: border-box;
             display: flex;
             justify-content: center;
             align-items: center;
-            color: white;
-            font-size: 24px;
-            opacity: 0.7;
+            color: rgba(255, 255, 255, 0.3);
+            font-size: 28px;
+            opacity: 0.3;
+            background: rgba(10, 20, 40, 0.05);
+            box-shadow: inset 0 0 50px rgba(100, 180, 255, 0.1), 
+                        0 0 30px rgba(100, 150, 255, 0.1);
+            transition: all 0.8s ease;
         }
         
-        .front  { transform: translateZ(150px); background: rgba(255, 0, 0, 0.1); }
-        .back   { transform: rotateY(180deg) translateZ(150px); background: rgba(0, 255, 0, 0.1); }
-        .right  { transform: rotateY(90deg) translateZ(150px); background: rgba(0, 0, 255, 0.1); }
-        .left   { transform: rotateY(-90deg) translateZ(150px); background: rgba(255, 255, 0, 0.1); }
-        .top    { transform: rotateX(90deg) translateZ(150px); background: rgba(255, 0, 255, 0.1); }
-        .bottom { transform: rotateX(-90deg) translateZ(150px); background: rgba(0, 255, 255, 0.1); }
+        .face:hover {
+            opacity: 0.6;
+            box-shadow: inset 0 0 80px rgba(100, 200, 255, 0.3), 
+                        0 0 60px rgba(100, 180, 255, 0.3);
+        }
+        
+        .front  { transform: translateZ(250px); }
+        .back   { transform: rotateY(180deg) translateZ(250px); }
+        .right  { transform: rotateY(90deg) translateZ(250px); }
+        .left   { transform: rotateY(-90deg) translateZ(250px); }
+        .top    { transform: rotateX(90deg) translateZ(250px); }
+        .bottom { transform: rotateX(-90deg) translateZ(250px); }
         
         .solar-system {
             position: absolute;
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
-            width: 200px;
-            height: 200px;
+            width: 400px;
+            height: 400px;
         }
         
         .sun {
             position: absolute;
             top: 50%;
             left: 50%;
-            width: 40px;
-            height: 40px;
-            background: radial-gradient(circle, #ffd700, #ff8c00);
+            width: 80px;
+            height: 80px;
+            background: radial-gradient(circle, #fff 0%, #ffd700 30%, #ff8c00 70%, #ff4500 100%);
             border-radius: 50%;
             transform: translate(-50%, -50%);
-            box-shadow: 0 0 20px #ff8c00;
+            box-shadow: 0 0 60px #ff8c00, 0 0 120px rgba(255, 140, 0, 0.7);
+            animation: pulsate 4s infinite ease-in-out;
+            z-index: 10;
         }
         
-        .planet {
+        .sun-corona {
             position: absolute;
             top: 50%;
             left: 50%;
+            width: 120px;
+            height: 120px;
             border-radius: 50%;
-            transform-origin: 0 0;
+            transform: translate(-50%, -50%);
+            background: radial-gradient(circle, rgba(255, 140, 0, 0.5) 0%, transparent 70%);
+            animation: corona-pulse 6s infinite alternate;
+            z-index: 5;
+        }
+        
+        .particle {
+            position: absolute;
+            background: rgba(255, 215, 0, 0.7);
+            border-radius: 50%;
+            animation: float 8s infinite linear;
         }
         
         .orbit {
@@ -90,43 +137,171 @@
             transform: translate(-50%, -50%);
         }
         
+        .planet {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            border-radius: 50%;
+            transform-origin: 0 0;
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.3);
+            transition: transform 0.3s ease;
+            z-index: 2;
+        }
+        
+        .planet:hover {
+            transform: scale(1.5);
+            z-index: 20;
+        }
+        
+        .planet-label {
+            position: absolute;
+            color: white;
+            font-size: 10px;
+            text-shadow: 0 0 5px rgba(0, 0, 0, 0.8);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+            white-space: nowrap;
+            transform: translate(-50%, -100%);
+            background: rgba(0, 0, 0, 0.5);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        
+        .planet:hover .planet-label {
+            opacity: 1;
+        }
+        
         .mercury { 
-            width: 8px; 
-            height: 8px; 
-            background: #a9a9a9; 
-            animation: orbit 4s infinite linear;
+            width: 12px; 
+            height: 12px; 
+            background: radial-gradient(circle, #a9a9a9, #7a7a7a); 
+            animation: orbit 4s infinite linear, tilt-orbit-1 20s infinite alternate ease-in-out;
         }
+        
         .venus { 
-            width: 12px; 
-            height: 12px; 
-            background: #ffa500; 
-            animation: orbit 8s infinite linear;
+            width: 20px; 
+            height: 20px; 
+            background: radial-gradient(circle, #ffb366, #cc6600); 
+            animation: orbit 8s infinite linear, tilt-orbit-2 25s infinite alternate ease-in-out;
         }
+        
         .earth { 
-            width: 12px; 
-            height: 12px; 
-            background: #1e90ff; 
-            animation: orbit 12s infinite linear;
+            width: 20px; 
+            height: 20px; 
+            background: radial-gradient(circle, #4d94ff, #0066cc); 
+            animation: orbit 12s infinite linear, tilt-orbit-3 30s infinite alternate ease-in-out;
         }
+        
         .mars { 
-            width: 10px; 
-            height: 10px; 
-            background: #ff4500; 
-            animation: orbit 20s infinite linear;
+            width: 18px; 
+            height: 18px; 
+            background: radial-gradient(circle, #ff704d, #cc3300); 
+            animation: orbit 20s infinite linear, tilt-orbit-4 35s infinite alternate ease-in-out;
+        }
+        
+        .jupiter { 
+            width: 36px; 
+            height: 36px; 
+            background: radial-gradient(circle, #ffcc99, #cc9966); 
+            animation: orbit 40s infinite linear, tilt-orbit-5 40s infinite alternate ease-in-out;
+        }
+        
+        .saturn { 
+            width: 32px; 
+            height: 32px; 
+            background: radial-gradient(circle, #e6b800, #b38600); 
+            animation: orbit 60s infinite linear, tilt-orbit-6 45s infinite alternate ease-in-out;
+        }
+        
+        .saturn:after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 48px;
+            height: 12px;
+            background: rgba(230, 184, 0, 0.4);
+            border-radius: 50%;
+            transform: translate(-50%, -50%) rotateX(75deg);
+            box-shadow: 0 0 10px rgba(230, 184, 0, 0.5);
+            z-index: -1;
         }
         
         @keyframes rotateCube {
-            0% { transform: rotateX(0) rotateY(0); }
-            100% { transform: rotateX(360deg) rotateY(360deg); }
+            0% { transform: rotateX(0) rotateY(0) rotateZ(0); }
+            100% { transform: rotateX(360deg) rotateY(360deg) rotateZ(180deg); }
         }
         
         @keyframes orbit {
-            0% { transform: rotate(0deg) translateX(50px) rotate(0deg); }
-            100% { transform: rotate(360deg) translateX(50px) rotate(-360deg); }
+            0% { transform: rotate(0deg) translateX(var(--distance, 80px)) rotate(0deg); }
+            100% { transform: rotate(360deg) translateX(var(--distance, 80px)) rotate(-360deg); }
+        }
+        
+        @keyframes tilt-orbit-1 {
+            0%, 100% { transform: rotate(0deg) translateX(80px) rotate(0deg) rotateX(0deg); }
+            50% { transform: rotate(180deg) translateX(80px) rotate(-180deg) rotateX(25deg); }
+        }
+        
+        @keyframes tilt-orbit-2 {
+            0%, 100% { transform: rotate(0deg) translateX(120px) rotate(0deg) rotateX(10deg); }
+            50% { transform: rotate(180deg) translateX(120px) rotate(-180deg) rotateX(-15deg); }
+        }
+        
+        @keyframes tilt-orbit-3 {
+            0%, 100% { transform: rotate(0deg) translateX(160px) rotate(0deg) rotateX(5deg); }
+            50% { transform: rotate(180deg) translateX(160px) rotate(-180deg) rotateX(20deg); }
+        }
+        
+        @keyframes tilt-orbit-4 {
+            0%, 100% { transform: rotate(0deg) translateX(200px) rotate(0deg) rotateX(-10deg); }
+            50% { transform: rotate(180deg) translateX(200px) rotate(-180deg) rotateX(15deg); }
+        }
+        
+        @keyframes tilt-orbit-5 {
+            0%, 100% { transform: rotate(0deg) translateX(240px) rotate(0deg) rotateX(15deg); }
+            50% { transform: rotate(180deg) translateX(240px) rotate(-180deg) rotateX(-5deg); }
+        }
+        
+        @keyframes tilt-orbit-6 {
+            0%, 100% { transform: rotate(0deg) translateX(280px) rotate(0deg) rotateX(-5deg); }
+            50% { transform: rotate(180deg) translateX(280px) rotate(-180deg) rotateX(10deg); }
+        }
+        
+        @keyframes pulsate {
+            0%, 100% { box-shadow: 0 0 60px #ff8c00, 0 0 120px rgba(255, 140, 0, 0.7); }
+            50% { box-shadow: 0 0 80px #ff8c00, 0 0 150px rgba(255, 140, 0, 0.9); }
+        }
+        
+        @keyframes corona-pulse {
+            0% { opacity: 0.3; transform: translate(-50%, -50%) scale(1); }
+            100% { opacity: 0.7; transform: translate(-50%, -50%) scale(1.4); }
+        }
+        
+        @keyframes float {
+            0% { transform: translate(0, 0) rotate(0deg); opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { transform: translate(var(--tx, 100px), var(--ty, -50px)) rotate(360deg); opacity: 0; }
+        }
+        
+        .info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 16px;
+            z-index: 100;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 8px 15px;
+            border-radius: 20px;
+            backdrop-filter: blur(5px);
         }
     </style>
 </head>
 <body>
+    <div class="stars" id="stars"></div>
+    <div class="info">Astonishing 3D Solar System in a Rotating Cube</div>
     <div class="scene">
         <div class="cube">
             <div class="face front">Front</div>
@@ -138,17 +313,94 @@
             
             <div class="solar-system">
                 <div class="sun"></div>
-                <div class="orbit" style="width: 100px; height: 100px;"></div>
-                <div class="orbit" style="width: 130px; height: 130px;"></div>
-                <div class="orbit" style="width: 160px; height: 160px;"></div>
-                <div class="orbit" style="width: 190px; height: 190px;"></div>
+                <div class="sun-corona"></div>
                 
-                <div class="planet mercury"></div>
-                <div class="planet venus"></div>
-                <div class="planet earth"></div>
-                <div class="planet mars"></div>
+                <!-- Orbits -->
+                <div class="orbit" style="width: 160px; height: 160px;"></div>
+                <div class="orbit" style="width: 240px; height: 240px;"></div>
+                <div class="orbit" style="width: 320px; height: 320px;"></div>
+                <div class="orbit" style="width: 400px; height: 400px;"></div>
+                <div class="orbit" style="width: 480px; height: 480px;"></div>
+                <div class="orbit" style="width: 560px; height: 560px;"></div>
+                
+                <!-- Planets -->
+                <div class="planet mercury" style="--distance: 80px">
+                    <div class="planet-label">Mercury</div>
+                </div>
+                <div class="planet venus" style="--distance: 120px">
+                    <div class="planet-label">Venus</div>
+                </div>
+                <div class="planet earth" style="--distance: 160px">
+                    <div class="planet-label">Earth</div>
+                </div>
+                <div class="planet mars" style="--distance: 200px">
+                    <div class="planet-label">Mars</div>
+                </div>
+                <div class="planet jupiter" style="--distance: 240px">
+                    <div class="planet-label">Jupiter</div>
+                </div>
+                <div class="planet saturn" style="--distance: 280px">
+                    <div class="planet-label">Saturn</div>
+                </div>
             </div>
         </div>
     </div>
+
+    <script>
+        // Create starfield
+        const starsContainer = document.getElementById('stars');
+        for (let i = 0; i < 200; i++) {
+            const star = document.createElement('div');
+            star.classList.add('star');
+            
+            // Random position
+            const x = Math.random() * 100;
+            const y = Math.random() * 100;
+            
+            // Random size
+            const size = Math.random() * 2 + 0.5;
+            
+            // Random animation duration
+            const duration = Math.random() * 10 + 5;
+            
+            star.style.left = `${x}%`;
+            star.style.top = `${y}%`;
+            star.style.width = `${size}px`;
+            star.style.height = `${size}px`;
+            star.style.setProperty('--duration', `${duration}s`);
+            
+            starsContainer.appendChild(star);
+        }
+        
+        // Create solar particles
+        const solarSystem = document.querySelector('.solar-system');
+        for (let i = 0; i < 30; i++) {
+            const particle = document.createElement('div');
+            particle.classList.add('particle');
+            
+            // Random size
+            const size = Math.random() * 4 + 1;
+            
+            // Random starting position
+            const angle = Math.random() * Math.PI * 2;
+            const distance = Math.random() * 100 + 50;
+            const x = Math.cos(angle) * distance;
+            const y = Math.sin(angle) * distance;
+            
+            // Random movement
+            const tx = (Math.random() - 0.5) * 300;
+            const ty = (Math.random() - 0.5) * 300;
+            
+            particle.style.width = `${size}px`;
+            particle.style.height = `${size}px`;
+            particle.style.left = `calc(50% + ${x}px)`;
+            particle.style.top = `calc(50% + ${y}px)`;
+            particle.style.setProperty('--tx', `${tx}px`);
+            particle.style.setProperty('--ty', `${ty}px`);
+            particle.style.animationDuration = `${Math.random() * 10 + 8}s`;
+            
+            solarSystem.appendChild(particle);
+        }
+    </script>
 </body>
 </html>
