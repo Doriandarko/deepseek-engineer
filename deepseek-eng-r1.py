@@ -1646,7 +1646,7 @@ def execute_function_call_dict(tool_call_dict: Dict[str, Any]) -> str:
             try: 
                 apply_diff_edit(fp, args["original_snippet"], args["new_snippet"])
                 return f"Edit attempt on '{fp}'. Check console."
-            except Exception as e: 
+            except Exception as e:
                 return f"Error during edit_file call for '{fp}': {e}."
                 
         elif func_name == "git_init": 
@@ -1897,6 +1897,36 @@ def initialize_application() -> None:
         except Exception as e: 
             console.print(f"[yellow]Could not get Git branch: {e}.[/yellow]")
 
+def get_directory_tree_summary(root_dir: Path, max_depth: int = 3, max_entries: int = 100) -> str:
+    """
+    Generate a summary of the directory tree up to a certain depth and entry count.
+    """
+    lines = []
+    entry_count = 0
+
+    def walk(dir_path: Path, prefix: str = "", depth: int = 0):
+        nonlocal entry_count
+        if depth > max_depth or entry_count >= max_entries:
+            return
+        try:
+            entries = sorted([e for e in dir_path.iterdir() if not e.name.startswith('.')])
+        except Exception:
+            return
+        for entry in entries:
+            if entry_count >= max_entries:
+                lines.append(f"{prefix}... (truncated)")
+                return
+            if entry.is_dir():
+                lines.append(f"{prefix}{entry.name}/")
+                entry_count += 1
+                walk(entry, prefix + "  ", depth + 1)
+            else:
+                lines.append(f"{prefix}{entry.name}")
+                entry_count += 1
+
+    walk(root_dir)
+    return "\n".join(lines)
+
 def main() -> None:
     """Application entry point."""
     console.print(Panel.fit(
@@ -1905,7 +1935,14 @@ def main() -> None:
         "[dim]Type /help for commands. Ctrl+C to interrupt, Ctrl+D or /exit to quit.[/dim]",
         border_style="bright_blue"
     ))
-    
+
+    # Add directory structure as a system message before starting the main loop
+    dir_summary = get_directory_tree_summary(base_dir)
+    conversation_history.append({
+        "role": "system",
+        "content": f"Project directory structure at startup:\n\n{dir_summary}"
+    })
+
     initialize_application()
     main_loop()
 
