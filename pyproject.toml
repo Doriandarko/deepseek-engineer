@@ -11,3 +11,6 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "rich>=13.9.4",
 ]
+
+[project.scripts]
+deepseek-engineer = "deepseek_engineer_entrypoint:main"
